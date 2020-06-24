@@ -1,3 +1,4 @@
- ./obj
- ./.vscode
- ./.fuse_hidden000004b100000001
+./obj
+./.vscode
+.fuse_hidden*
+.out_message_*

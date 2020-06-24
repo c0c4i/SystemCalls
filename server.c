@@ -31,6 +31,7 @@ char *baseDeviceFIFO = "/tmp/def_fifo.";
 int msg_queue_ack_key = -1;
 
 int msqid_client = -1;
+int msqid_position = -1;
 int shmidScacchiera = -1;
 int *shmptrScacchiera;
 int shmidAckList = -1;
@@ -53,12 +54,17 @@ void sigTermServerHandler(int sig) {
 	free_shared_memory(shmptrScacchiera);
     remove_shared_memory(shmidScacchiera);
 	printf(" [DONE]\n");
-	
 
     printf("<Server> Removing Shared Memory Ack List...");
 	free_shared_memory(shmptrAckList);
     remove_shared_memory(shmidAckList);
-	printf(" [DONE]\n");
+	
+	printf("<Server> Removing Message Queue position...");
+	if (msgctl(msqid_position, IPC_RMID, NULL) == -1)
+		ErrExit("msgctl failed");
+	else
+		printf(" [DONE]\n");
+
 
     printf("<Server> Removing the Ack List semaphore set...");
     if (semctl(semid_ack_list, 0 /*ignored*/, IPC_RMID, NULL) == -1) {
@@ -99,13 +105,6 @@ void sigTermDeviceHandler(int sig) {
 }
 
 void sigTermAckHandler(int sig) {
-	// if (msqid_client >= 0) {
-    //     if (msgctl(msqid_client, IPC_RMID, NULL) == -1)
-    //         ErrExit("msgctl failed");
-    //     else
-    //         printf("<Ack Manager> Message Queue removed successfully\n");
-    // }
-
 	printf("<Ack Manager> Rimuovo la Message Queue...");
 	if (msgctl(msqid_client, IPC_RMID, NULL) == -1)
     	ErrExit("msgctl failed");
@@ -114,35 +113,9 @@ void sigTermAckHandler(int sig) {
     exit(0);
 }
 
-void initScacchiera() {
-	for(int i=0; i<SIZE; i++)
-		for(int j=0; j<SIZE; j++)
-			shmptrScacchiera[SIZE * i + j] = 0;
-}
-
-int findNearDevice(int near_device[], int x, int y, int max_distance) {
-	int n = 0;
-	int distance;
-	for(int i=0; i<SIZE; i++) {
-		for(int j=0; j<SIZE; j++) {
-			if(shmptrScacchiera[SIZE * i + j] != 0) {
-				distance = sqrt(pow (i-y, 2) + pow (j-x, 2));
-				// printf("<Device> This is distant %d from my device", distance);
-				if(distance <= max_distance && distance != 0) {
-					near_device[n] = shmptrScacchiera[SIZE * i + j];
-					n++;
-				}
-			}
-		}
-	}
-	return n;
-}
-
 int readPositionFromFile(Position device_position[], int file, int line) {	
 	char buffer;
-
 	lseek(file, (LINESIZE+1)*line, SEEK_SET);
-
 	for(int i=0; i<N_DEVICE; i++){
 
 		if(i>0) read(file, &buffer, 1);
@@ -164,9 +137,10 @@ int readPositionFromFile(Position device_position[], int file, int line) {
 }
 
 void changeDevicePosition(int pid, Position old, Position new) {
-	printf("Cambio posizione a %d mettendolo da [%d, %d] a [%d, %d] \n", pid, old.x, old.y, new.x, new.y);	
+	semOp(semid_scacchiera, 0, -1);
 	shmptrScacchiera[SIZE * old.y + old.x] = 0;
 	shmptrScacchiera[SIZE * new.y + new.x] = pid;
+	semOp(semid_scacchiera, 0, 1);
 }
 
 void signalInit() {
@@ -180,14 +154,14 @@ void signalInit() {
 	}
 }
 
-void shmAndSemInit() {
+void ipcsInit() {
 	// genera la shared memory della scacchiera
 	int shm_scacchiera_key = (int)(((double)rand() / RAND_MAX) * 255);
     printf("<Server> allocating a shared memory segment for scacchiera...");
     shmidScacchiera = alloc_shared_memory(shm_scacchiera_key, sizeof(int)*SIZE*SIZE);
 	shmptrScacchiera = (int*)get_shared_memory(shmidScacchiera, 0);
 	printf(" [DONE]\n");
-	initScacchiera();	
+	// initScacchiera();	
 
 	// genera la shared memory della lista di ack
 	int shm_ack_list_key = (int)(((double)rand() / RAND_MAX) * 255);
@@ -226,23 +200,6 @@ void shmAndSemInit() {
         ErrExit("semctl ack list SETALL failed");
 	printf(" [DONE]\n");
 
-	// FARE IL SEMAFORO PER GESTIRE LA CANCELLAZIONE SICURA DEGLI ACK
-
-	// genera il semaforo per il delete degli ack
-	printf("<Server> Generating semaphore for Ack Delete");
-    semid_ack_delete = semget(IPC_PRIVATE, 1, S_IRUSR | S_IWUSR);
-    if (semid_ack_delete == -1) {
-        ErrExit("semget failed");
-	}
-	printf(" [DONE]\n");
-
-	printf("<Server> Setting initial value semaphore for Ack Delete");
-	union semun arg_sem_ack_delete;
-    arg_sem_ack_delete.val = 0;
-	if (semctl(semid_ack_delete, 0, SETVAL, arg_sem_ack_delete) == -1)
-        ErrExit("semctl ack delete SETALL failed");
-	printf(" [DONE]\n");
-
 	// genera semafori per muovere i device
 	printf("<Server> Generating semaphore for Devices");
     semid_devices = semget(IPC_PRIVATE, 5, S_IRUSR | S_IWUSR);
@@ -259,20 +216,58 @@ void shmAndSemInit() {
         ErrExit("semctl devices SETALL failed");
 	}
 	printf(" [DONE]\n");
-	
+
+	// genera il semaforo per il delete degli ack
+	printf("<Server> Generating semaphore for Ack Delete");
+    semid_ack_delete = semget(IPC_PRIVATE, 1, S_IRUSR | S_IWUSR);
+    if (semid_ack_delete == -1) {
+        ErrExit("semget failed");
+	}
+	printf(" [DONE]\n");
+
+	printf("<Server> Setting initial value semaphore for Ack Delete");
+	union semun arg_sem_ack_delete;
+    arg_sem_ack_delete.val = 0;
+	if (semctl(semid_ack_delete, 0, SETVAL, arg_sem_ack_delete) == -1)
+        ErrExit("semctl ack delete SETALL failed");
+	printf(" [DONE]\n");
+
+	// genera la message queue per mandare le posizioni ai device
+    printf("<Server> allocating a message queue for positioning device...");
+	msqid_position = msgget(IPC_PRIVATE, S_IRUSR | S_IWUSR);
+    if (msqid_position == -1) {
+        ErrExit("msgget failed");
+	}
+	printf("msqid_position: %d ", msqid_position);
+	printf(" [DONE]\n");
+}
+
+int findAck(int *ack_index, int message_id) {
+	int n = 0;
+	semOp(semid_ack_list, 0, -1);
+	for(int i=0; i<MAX_ACK; i++) {
+		if(shmptrAckList[i].message_id == message_id) {
+			ack_index[n] = i;
+			n++;
+		}
+	}
+	semOp(semid_ack_list, 0, 1);
+	return n;
 }
 
 int howmuch(int message_id) {
 	int n = 0;
-	for(int i=0; i<MAX_ACK; i++) {
+	semOp(semid_ack_list, 0, -1);
+	for(int i=0; i<MAX_ACK; i++)
 		if(shmptrAckList[i].message_id == message_id) n++;
-	}
+	semOp(semid_ack_list, 0, 1);
 	return n;
 }
 
 void ackManager() {
 	printf("<Ack Manager> Making Message Queue...");
 	msqid_client = msgget(msg_queue_ack_key, IPC_CREAT | S_IRUSR | S_IWUSR);
+	printf("msqid_client: %d\n", msqid_client);
 	if (msqid_client == -1)
 		ErrExit("msgget failed");
 	printf(" [DONE]\n");
@@ -282,37 +277,98 @@ void ackManager() {
 	}
 
 	while(1) {
-		// printf("<Ack Manager> Controllo se i device hanno ricevuto il messaggio!\n");
-
+		int ack_index[N_DEVICE];
+		msgq_ack ack_struct;
 		for(int i=0; i<MAX_ACK; i++) {
-			printf("<ACK %2d> %d %d %d\n", i, shmptrAckList[i].pid_sender, shmptrAckList[i].pid_receiver, shmptrAckList[i].message_id);
-		}
-
-		for(int i=0; i<MAX_ACK; i++) {
-			if(howmuch(shmptrAckList[i].message_id) == N_DEVICE) {
-				semOp(semid_ack_delete, 0, -1);
-				printf("<Ack Manager> Tolgo gli ack dalla lista!");
+			if(findAck(ack_index, shmptrAckList[i].message_id) == N_DEVICE) {
 				// preparo il messaggio da scrivere nella shared memory del client
-				
+				semOp(semid_ack_delete, 0, -1);
+				printf("<Ack Manager> Tolgo gli ack dalla lista...");
+				for(int k=0; k<N_DEVICE; k++) {
+					ack_struct.acklist[k] = shmptrAckList[ack_index[k]];
+					shmptrAckList[ack_index[k]].message_id = 0;
+				}
+				ack_struct.mtype = ack_struct.acklist[0].message_id;
+				printf(" [DONE]\n");
+
+				// send message to client
+				printf("<Ack Manager> Sending message to client...");
+				size_t mSize = sizeof(msgq_ack) - sizeof(long);
+				if (msgsnd(msqid_client, &ack_struct, mSize, 0) == -1)
+					ErrExit("msgsnd failed");
+				printf(" [DONE]\n");
 			}
 		}
-
 		sleep(5);
 	}
 }
 
 int checkAckList(int pid, int message_id) {
-	for(int k=0; k<MAX_ACK; k++) {
+	int find = 0;
+	semOp(semid_ack_list, 0, -1);
+	for(int k=0; k<MAX_ACK && !find; k++) {
 		if(shmptrAckList[k].message_id == message_id && shmptrAckList[k].pid_receiver == pid) {
-			return 1;
+			find = 1;
 		}
 	}
-	return 0;
+	semOp(semid_ack_list, 0, 1);
+	return find;
+}
+
+int findOneNearDevice(int x, int y, int max_distance, int message_id) {
+	int distance;
+	int alreadyReceived;
+	int pid = 0;
+	char found = 0;
+	semOp(semid_scacchiera, 0, -1);
+	for(int i=0; i<SIZE && !found; i++) {
+		for(int j=0; j<SIZE && !found; j++ ) {
+			pid = shmptrScacchiera[SIZE * i + j];
+			if(pid != 0) {
+				distance = sqrt(pow(i-y, 2) + pow(j-x, 2));
+				alreadyReceived = checkAckList(pid, message_id);
+				found = (distance <= max_distance && distance != 0 && !alreadyReceived);
+			}
+		}
+	}
+	semOp(semid_scacchiera, 0, 1);
+	return pid;
+}
+
+void sendMessageToDevice(Message m, int pid) {
+	char path2NearDeviceFIFO[25];
+	int deviceNearFIFO;
+
+	sprintf(path2NearDeviceFIFO, "%s%d", baseDeviceFIFO, pid);
+	deviceNearFIFO = open(path2NearDeviceFIFO, O_WRONLY);
+	if (deviceNearFIFO == -1)
+		ErrExit("open failed");
+	if (write(deviceNearFIFO, &m, sizeof(Message)) != sizeof(Message))
+		ErrExit("write failed");
+}
+
+/*visualizza i numeri contenuti nella lista*/
+deviceMessage* readAndSendMessages(deviceMessage* lista, Position p, int pid){
+	deviceMessage *temp = lista;
+
+	while(temp != NULL) {
+		int near = findOneNearDevice(p.x, p.y, temp->m.max_distance, temp->m.message_id);
+		if(near > 0) {
+			sendMessageToDevice(temp->m, near);
+			temp = removeMessage(lista, temp->m.message_id);
+			lista = temp;
+		} else temp = temp->next;
+	}
+	return lista;
 }
 
 void device(int device_number, Position p) {
-	semOp(semid_devices, (unsigned short) device_number, -1);
+	// semOp(semid_devices, (unsigned short) device_number, -1);
+	deviceMessage *head = NULL;
 	pid_t pid = getpid();
+	Position curr_p = p;
+	Position new_p;
+
 	printf("<Server> Device %d created with PID %d\n", device_number, pid);
 	if (signal(SIGTERM, sigTermDeviceHandler) == SIG_ERR) {
 		ErrExit("change signal handler failed\n");
@@ -334,71 +390,63 @@ void device(int device_number, Position p) {
 	shmptrScacchiera[SIZE * p.y + p.x] = pid;
 	semOp(semid_scacchiera, 0, 1);
 
-	semOp(semid_devices, (unsigned short) device_number, 1);
-
-	int device_near[N_DEVICE];
-	int near;
+	// semOp(semid_devices, (unsigned short) device_number, 1);
 
 	while(1) {
-		semOp(semid_devices, (unsigned short) device_number, -1);
-		semOp(semid_scacchiera, 0, -1);
+		// semOp(semid_devices, (unsigned short) device_number, -1);
+		// 1. leggere i messaggi dalla mia lista se ci sono
+		// 		Se ci sono li manda
+		head = readAndSendMessages(head, p, pid);
 
-		/*
-			4. Cambia posizione nella shared memory leggendola nella shared memory
-		*/
-
+		// 2. legge i messaggi dalla fifo
+		//		Se ci sono filtra i nuovi
+		// 		Se sono nuovi li salva nella propria lista
 		Message m;
 		int bR = -1;
 		int errno;
-		char path2NearDeviceFIFO[25];
-		int deviceNearFIFO;
 
 		do {
 			bR = read(deviceFIFO, &m, sizeof(Message));
 			if (bR == -1 && errno != EAGAIN)
 				printf("<Server> it looks like the FIFO is broken\n");
 			if (bR == sizeof(Message)) {
-				// WRITE ACK ON ACK LIST
+				// Add an Ack
 				semOp(semid_ack_list, 0, -1);
-				int alreadyReceived = checkAckList(pid, m.message_id);
-				if(!alreadyReceived) {
-					printf("<Device %d> Un nuovo messaggio trovato!\n", device_number);
-					for(int k=0; k<MAX_ACK; k++) {
-						if(shmptrAckList[k].message_id == 0) {
-							printf("<Device %d> Salvo un ACK...", device_number);
-							Acknowledgment ack;
-							ack.pid_sender = m.pid_sender;
-							ack.pid_receiver = pid;
-							ack.message_id = m.message_id;
-							ack.timestamp = time(NULL);
-							shmptrAckList[k] = ack;
-							printf(" [DONE]\n");
-							break;
-						}
+				for(int k=0; k<MAX_ACK; k++) {
+					if(shmptrAckList[k].message_id == 0) {
+						printf("<Device %d> Nuovo messaggio letto! Salvo un ACK...", device_number);
+						Acknowledgment ack;
+						ack.pid_sender = m.pid_sender;
+						ack.pid_receiver = pid;
+						ack.message_id = m.message_id;
+						ack.timestamp = time(NULL);
+						shmptrAckList[k] = ack;
+						printf(" [DONE]\n");
+						break;
 					}
-
-					near = findNearDevice(device_near, p.x, p.y, m.max_distance);
-					m.pid_sender = pid;
-					for(int i=0; i<near; i++) {
-						// SEND MESSAGE TO NEAR DEVICE
-						m.pid_receiver = device_near[i];
-						sprintf(path2NearDeviceFIFO, "%s%d", baseDeviceFIFO, device_near[i]);
-						deviceNearFIFO = open(path2NearDeviceFIFO, O_WRONLY);
-						if (deviceNearFIFO == -1)
-							ErrExit("open failed");
-						if (write(deviceNearFIFO, &m, sizeof(Message)) != sizeof(Message))
-							ErrExit("write failed");
-					}
-				} else if(howmuch(m.message_id) == 5) {
-					// sblocca il semaforo della cancellazione con ack list
-					semOp(semid_ack_delete, 0, 1);
 				}
 				semOp(semid_ack_list, 0, 1);
+
+				int hm = howmuch(m.message_id);
+				if( hm == N_DEVICE || hm == 0) {
+					semOp(semid_ack_delete, 0, 1);
+				} else {
+					m.pid_sender = pid;
+					head = putMessage(head, m);
+				}
+				
 			}
 		} while(!((bR == -1 && errno == EAGAIN) || (bR == 0)));
 
-		
-		semOp(semid_scacchiera, 0, 1);
+		// legge dalla shared memory se ha una nuova posizione e la cambia
+		semOp(semid_devices, (unsigned short) device_number, -1);
+			msgq_position msgq_pos;
+			size_t mSize = sizeof(msgq_position) - sizeof(long);
+			if (msgrcv(msqid_position, &msgq_pos, mSize, device_number+1, 0) == -1)
+				ErrExit("msgget failed ah boh");
+			new_p = msgq_pos.p;
+			changeDevicePosition(pid, curr_p, new_p);
+			curr_p = new_p;
 		semOp(semid_devices, (unsigned short) (device_number == 4) ? 0 : device_number + 1, 1);
 	}
 }
@@ -406,7 +454,7 @@ void device(int device_number, Position p) {
 void printScacchiera() {
 	for(int i=0; i<SIZE; i++) {
 		for(int j=0; j<SIZE; j++){
-			printf("%5d", shmptrScacchiera[SIZE * i + j]);
+			printf("%7d", shmptrScacchiera[SIZE * i + j]);
 		}
 		printf("\n");
 	}
@@ -438,7 +486,7 @@ int main(int argc, char * argv[]) {
 	signalInit();
 
 	// GENERO LE MEMORIE E SEMAFORI NECESSARI
-	shmAndSemInit();
+	ipcsInit();
 
 	// ACK MANAGER
 	pid_t pid = fork();
@@ -449,18 +497,13 @@ int main(int argc, char * argv[]) {
 	}
 	
 	Position device_position[N_DEVICE];
-
 	int file = open(filename, O_RDONLY);
 	if (file == -1) {
 		ErrExit("File not found");
 	}
 	int line = 0;
 
-	semOp(semid_scacchiera, 0, -1);
-
 	readPositionFromFile(device_position, file, line);
-
-	semOp(semid_scacchiera, 0, 1);
 
 	// DEVICE
 	for (int i = 0; i < 5; ++i) {
@@ -476,10 +519,7 @@ int main(int argc, char * argv[]) {
 
 	// ogni due secondi muove i device con le posizioni lette dal file	
 	while(1) {
-
-		for(int i=0; i<N_DEVICE; i++) {
-			// aggiungo alla shared memory del device le posizioni
-		}
+		sleep(2);
 
 		if(readPositionFromFile(device_position, file, line))
 			line++;
@@ -487,7 +527,22 @@ int main(int argc, char * argv[]) {
 			line = 0;
 		}
 
-		sleep(2);
+		msgq_position msgq_pos;
+		for(int i=0; i<N_DEVICE; i++) {
+			// send the order to the server through the message queue
+			// printf("<Server> Dico al device %i di spostarsi in [%d, %d]\n", i, device_position[i].x, device_position[i].y);
+			msgq_pos.mtype = i+1;
+			msgq_pos.p = device_position[i];
+			size_t mSize = sizeof(msgq_position) - sizeof(long);
+			if (msgsnd(msqid_position, &msgq_pos, mSize, 0) == -1)
+				ErrExit("msgsnd failed");
+		}
+
+		// semOp(semid_scacchiera, 0, -1);
+		// printf("Stampa numero %d \n", line-1);
+		// printScacchiera();
+		// semOp(semid_scacchiera, 0, 1);
+		// semOp(semid_devices, (unsigned short) 0, 1);
 	}
 
     return 0;

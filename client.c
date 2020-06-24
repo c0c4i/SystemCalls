@@ -13,6 +13,9 @@
 #include <sys/stat.h>
 #include <sys/msg.h>
 #include <time.h>
+
+#define FILE_OUT_PATH "./out_message_%d.txt"
+#define N_DEVICE 5
  
 // usato per leggere un intero da tastiera
 int readInt(const char *s) {
@@ -30,17 +33,32 @@ int readInt(const char *s) {
 }
 
 // converte un timestamp in stringa
-char* timestampToString(time_t timestamp) {
-//   struct tm time = *localtime(&timestamp);
-//   char* s[30];
-//   sprintf(s, "%d-%02d-%02d %02d:%02d:%02d\n", time.tm_year + 1900, time.tm_mon + 1, time.tm_mday, time.tm_hour, time.tm_min, time.tm_sec);
+void timestampToString(time_t timestamp, char* out) {
+    struct tm time = *localtime(&timestamp);
+    sprintf(out, "%d-%02d-%02d %02d:%02d:%02d", time.tm_year + 1900, time.tm_mon + 1, time.tm_mday, time.tm_hour, time.tm_min, time.tm_sec);
 }
 
 // crea il file con gli ack
 void createFile(Message message, Acknowledgment acklist[5]) {
+	char file_path[255];
+    char header[512];
+    char line[512];
 
-	printf("Messaggio %d: %s\n", message.message_id, message.message);
-	// creo il file
+    sprintf(file_path, FILE_OUT_PATH, message.message_id);
+
+    int file = open(file_path, O_WRONLY | O_CREAT | O_TRUNC | S_IRUSR, 0777);
+
+    sprintf(header, "Messaggio %d : %s \nLista acknowledgment: \n", message.message_id, message.message);
+    write(file, header, strlen(header));
+
+    for(int i = 0; i<N_DEVICE; i++){
+        char out[30];
+        timestampToString(acklist[i].timestamp, out);
+        sprintf(line, "%d, %d, %s\n", acklist[i].pid_sender, acklist[i].pid_receiver, out); 
+        write(file, line, strlen(line));
+    }
+
+    close(file);
 }
 
 char *baseDeviceFIFO = "/tmp/def_fifo.";
@@ -109,24 +127,23 @@ int main(int argc, char * argv[]) {
         ErrExit("open failed");
 
     printf("<Client> sending message to device %d on FIFO in %s\n", message.pid_receiver, path2DeviceFIFO);
-    if (write(deviceFIFO, &message, sizeof(Message)) != sizeof(Message))
+    if (write(deviceFIFO, &message, sizeof(Message)) != sizeof(Message)) {
         ErrExit("write failed");
+    }
 	printf("<Client> Message sended! Wait to receive all device!\n");
 
 	// ATTESA MESSAGE QUEUE
 
-	struct ack_msg {
-		long mtype;
-		Acknowledgment acklist[5];
-	} m;
+	msgq_ack ack;
 	
 	// read a message from the message queue
-	size_t mSize = sizeof(struct ack_msg) - sizeof(long);
-	if (msgrcv(msqid, &m, mSize, message.message_id, 0) == -1)
+	size_t mSize = sizeof(msgq_ack) - sizeof(long);
+	if (msgrcv(msqid, &ack, mSize, message.message_id, 0) == -1)
 		ErrExit("msgget failed");
 
-	createFile(message, m.acklist);
+    printf("<Client> Ricevuto l'ack di tutti i device del messaggio!\n");
+	createFile(message, ack.acklist);
+    printf("File created. I will die bye!\n");
 
-	printf("File created. I will die bye!");
     return 0;
 }
