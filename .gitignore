@@ -1,4 +1,4 @@
 ./obj
 ./.vscode
 .fuse_hidden*
-.out_message_*
+out_message_*
