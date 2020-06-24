@@ -1,7 +1,0 @@
-{
-    "files.associations": {
-        "sstream": "c",
-        "cmath": "c",
-        "iterator": "c"
-    }
-}
